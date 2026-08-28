@@ -1,15 +1,16 @@
 """
-Phase 4: Measure per-image damage caused by quantization.
+Phase 4: Measure per-image damage caused by INT8 quantization.
 
-For every image in the same 3,000-image subset used during training,
-compare the original FP32 model with the quantized INT8 model.
+Compares the original FP32 model from Phase 1 with the complete
+quantized INT8 model produced by compress.py.
 
-Records:
+For each of the same 3,000 training images, records:
+- true label
 - original prediction
-- original confidence for the true class
+- original true-class confidence
 - quantized prediction
-- quantized confidence for the true class
-- prediction flip
+- quantized true-class confidence
+- whether prediction flipped
 - confidence drop
 """
 
@@ -36,12 +37,7 @@ MODEL_PATH = os.path.join(
 
 QUANTIZED_MODEL_PATH = os.path.join(
     RESULTS_DIR,
-    "model_quantized.pt",
-)
-
-SUBSET_PATH = os.path.join(
-    RESULTS_DIR,
-    "subset_indices.csv",
+    "model_int8.pt",
 )
 
 OUTPUT_PATH = os.path.join(
@@ -91,10 +87,6 @@ class SmallCNN(nn.Module):
 # ============================================================
 
 class IndexedDataset(Dataset):
-    """
-    Returns image, label, and the original CIFAR-10 image ID.
-    """
-
     def __init__(self, dataset, indices):
         self.dataset = dataset
         self.indices = indices
@@ -110,22 +102,16 @@ class IndexedDataset(Dataset):
 
 
 # ============================================================
-# Load checkpoint
+# Load original FP32 model
 # ============================================================
 
 checkpoint = torch.load(
     MODEL_PATH,
     map_location="cpu",
+    weights_only=False,
 )
 
 subset_indices = checkpoint["subset_indices"]
-
-print("Images to evaluate:", len(subset_indices))
-
-
-# ============================================================
-# Load original FP32 model
-# ============================================================
 
 original_model = SmallCNN()
 
@@ -139,26 +125,24 @@ print("Original FP32 model loaded.")
 
 
 # ============================================================
-# Reconstruct quantized model
+# Load complete INT8 model
 # ============================================================
 
-torch.backends.quantized.engine = "x86"
-
-quantized_model = SmallCNN()
-
-quantized_model.qconfig = torch.ao.quantization.get_default_qconfig(
-    "x86"
+quantized_model = torch.load(
+    QUANTIZED_MODEL_PATH,
+    map_location="cpu",
+    weights_only=False,
 )
 
-torch.ao.quantization.prepare(
-    quantized_model,
-    inplace=True,
-)
+quantized_model.eval()
+
+print("Complete INT8 model loaded.")
 
 
-# Calibration is required before loading the quantized
-# state dictionary because the quantized module structure
-# must exist first.
+# ============================================================
+# Dataset
+# ============================================================
+
 transform = transforms.Compose([
     transforms.ToTensor(),
 ])
@@ -169,49 +153,6 @@ base_dataset = datasets.CIFAR10(
     download=True,
     transform=transform,
 )
-
-calibration_indices = subset_indices[:300]
-
-calibration_dataset = torch.utils.data.Subset(
-    base_dataset,
-    calibration_indices,
-)
-
-calibration_loader = DataLoader(
-    calibration_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-)
-
-
-print("Calibrating quantized model...")
-
-with torch.no_grad():
-    for images, _ in calibration_loader:
-        quantized_model(images)
-
-quantized_model = torch.ao.quantization.convert(
-    quantized_model,
-    inplace=False,
-)
-
-quantized_state_dict = torch.load(
-    QUANTIZED_MODEL_PATH,
-    map_location="cpu",
-)
-
-quantized_model.load_state_dict(
-    quantized_state_dict,
-)
-
-quantized_model.eval()
-
-print("Quantized INT8 model loaded.")
-
-
-# ============================================================
-# Evaluation dataset
-# ============================================================
 
 evaluation_dataset = IndexedDataset(
     base_dataset,
@@ -224,6 +165,11 @@ evaluation_loader = DataLoader(
     shuffle=False,
 )
 
+print(
+    "Images to evaluate:",
+    len(evaluation_dataset),
+)
+
 
 # ============================================================
 # Evaluate both models
@@ -231,55 +177,56 @@ evaluation_loader = DataLoader(
 
 results = []
 
-print("Evaluating 3,000 images...")
-
 with torch.no_grad():
 
     for images, labels, image_ids in evaluation_loader:
 
+        # Original model
         original_logits = original_model(images)
+
+        # Quantized model
         quantized_logits = quantized_model(images)
 
-        original_probabilities = torch.softmax(
+        original_probs = torch.softmax(
             original_logits,
             dim=1,
         )
 
-        quantized_probabilities = torch.softmax(
+        quantized_probs = torch.softmax(
             quantized_logits,
             dim=1,
         )
 
         original_predictions = (
-            original_probabilities.argmax(dim=1)
+            original_probs.argmax(dim=1)
         )
 
         quantized_predictions = (
-            quantized_probabilities.argmax(dim=1)
+            quantized_probs.argmax(dim=1)
         )
 
-        for index in range(len(images)):
+        for i in range(len(images)):
 
-            true_label = int(labels[index])
+            true_label = int(labels[i])
 
             original_prediction = int(
-                original_predictions[index]
+                original_predictions[i]
             )
 
             quantized_prediction = int(
-                quantized_predictions[index]
+                quantized_predictions[i]
             )
 
             original_confidence = float(
-                original_probabilities[
-                    index,
+                original_probs[
+                    i,
                     true_label,
                 ].item()
             )
 
             quantized_confidence = float(
-                quantized_probabilities[
-                    index,
+                quantized_probs[
+                    i,
                     true_label,
                 ].item()
             )
@@ -295,7 +242,7 @@ with torch.no_grad():
             )
 
             results.append([
-                int(image_ids[index]),
+                int(image_ids[i]),
                 true_label,
                 original_prediction,
                 original_confidence,
@@ -307,8 +254,13 @@ with torch.no_grad():
 
 
 # ============================================================
-# Save results
+# Save damage results
 # ============================================================
+
+os.makedirs(
+    RESULTS_DIR,
+    exist_ok=True,
+)
 
 with open(
     OUTPUT_PATH,
@@ -336,17 +288,20 @@ with open(
 # Summary
 # ============================================================
 
+num_images = len(results)
+
 num_flipped = sum(
-    row[6] for row in results
+    row[6]
+    for row in results
 )
 
 flip_rate = (
-    num_flipped / len(results)
+    num_flipped / num_images
 )
 
 print()
 print("Damage evaluation complete.")
-print("Images evaluated:", len(results))
+print("Images evaluated:", num_images)
 print("Prediction flips:", num_flipped)
 print(
     f"Flip rate: {flip_rate * 100:.2f}%"
