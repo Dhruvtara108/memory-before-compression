@@ -5,8 +5,5 @@ __pycache__/
 # Local datasets
 data/
 
-# Experiment outputs
-results/
-
 # Jupyter
 .ipynb_checkpoints/
