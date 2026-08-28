@@ -190,21 +190,19 @@ with torch.no_grad():
     for images, _ in calibration_loader:
         quantized_model(images)
 
-
-quantized_model = torch.ao.quantization.convert(
-    quantized_model,
-    inplace=False,
-)
-
 quantized_state_dict = torch.load(
     QUANTIZED_MODEL_PATH,
     map_location="cpu",
 )
 
 quantized_model.load_state_dict(
-    quantized_state_dict
+    quantized_state_dict,
 )
 
+quantized_model = torch.ao.quantization.convert(
+    quantized_model,
+    inplace=False,
+)
 quantized_model.eval()
 
 print("Quantized INT8 model loaded.")
