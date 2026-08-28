@@ -1,9 +1,9 @@
 """
 Phase 3: Post-training static INT8 quantization.
 
-Loads the trained CNN checkpoint, calibrates the model using
-a subset of the training images, converts the model to INT8,
-verifies INT8 inference, and saves the complete quantized model.
+Loads the trained FP32 CNN, calibrates it using a subset of CIFAR-10,
+converts it to INT8, serializes it using TorchScript, verifies inference,
+and reports checkpoint size reduction.
 """
 
 import os
@@ -26,9 +26,9 @@ MODEL_PATH = os.path.join(
     "model.pt",
 )
 
-QUANTIZED_MODEL_PATH = os.path.join(
+SCRIPTED_MODEL_PATH = os.path.join(
     RESULTS_DIR,
-    "model_int8.pt",
+    "model_int8_scripted.pt",
 )
 
 CALIBRATION_IMAGES = 300
@@ -81,12 +81,11 @@ class SmallCNN(nn.Module):
         x = torch.flatten(x, 1)
         x = self.classifier(x)
         x = self.dequant(x)
-
         return x
 
 
 # ============================================================
-# Load original FP32 model
+# Load original FP32 checkpoint
 # ============================================================
 
 checkpoint = torch.load(
@@ -95,20 +94,20 @@ checkpoint = torch.load(
     weights_only=False,
 )
 
-original_model = SmallCNN()
+model = SmallCNN()
 
-original_model.load_state_dict(
+model.load_state_dict(
     checkpoint["model_state_dict"],
     strict=False,
 )
 
-original_model.eval()
+model.eval()
 
 print("Original model loaded.")
 
 
 # ============================================================
-# Dataset
+# Load CIFAR-10
 # ============================================================
 
 transform = transforms.Compose([
@@ -129,7 +128,7 @@ print(
 
 
 # ============================================================
-# Reproduce the exact Phase 1 subset
+# Reproduce Phase 1 subset
 # ============================================================
 
 subset_indices = checkpoint["subset_indices"]
@@ -156,17 +155,17 @@ print(
 
 
 # ============================================================
-# Configure quantization
+# Prepare for static quantization
 # ============================================================
 
 torch.backends.quantized.engine = "x86"
 
-original_model.qconfig = (
+model.qconfig = (
     torch.ao.quantization.get_default_qconfig("x86")
 )
 
 torch.ao.quantization.prepare(
-    original_model,
+    model,
     inplace=True,
 )
 
@@ -180,7 +179,7 @@ print("Starting calibration...")
 with torch.no_grad():
 
     for images, _ in calibration_loader:
-        original_model(images)
+        model(images)
 
 print("Calibration complete.")
 
@@ -190,7 +189,7 @@ print("Calibration complete.")
 # ============================================================
 
 quantized_model = torch.ao.quantization.convert(
-    original_model,
+    model,
     inplace=False,
 )
 
@@ -200,7 +199,7 @@ print("INT8 quantization complete.")
 
 
 # ============================================================
-# Verify INT8 inference on real CIFAR-10 images
+# Real-image inference sanity check
 # ============================================================
 
 test_images, test_labels = next(
@@ -208,74 +207,187 @@ test_images, test_labels = next(
 )
 
 test_images = test_images[:5]
-test_labels = test_labels[:5]
 
 with torch.no_grad():
-    int8_outputs = quantized_model(test_images)
 
-print(
-    "INT8 inference successful."
+    test_outputs = quantized_model(
+        test_images
+    )
+
+test_predictions = (
+    test_outputs.argmax(dim=1)
 )
 
+print("INT8 inference successful.")
 print(
     "Test images:",
-    test_images.shape[0],
+    len(test_images),
 )
 
 print(
     "Output shape:",
-    int8_outputs.shape,
+    test_outputs.shape,
 )
 
 print(
     "Predictions:",
-    int8_outputs.argmax(dim=1).tolist(),
+    test_predictions.tolist(),
 )
 
 print(
     "True labels:",
-    test_labels.tolist(),
+    test_labels[:5].tolist(),
 )
 
 
 # ============================================================
-# Save COMPLETE quantized model
+# TorchScript serialization
 # ============================================================
 
-os.makedirs(
-    RESULTS_DIR,
-    exist_ok=True,
+print("Creating TorchScript model...")
+
+try:
+
+    scripted_model = torch.jit.script(
+        quantized_model
+    )
+
+    scripted_model.save(
+        SCRIPTED_MODEL_PATH
+    )
+
+    serialization_method = "script"
+
+    print(
+        "TorchScript scripting successful."
+    )
+
+except Exception as script_error:
+
+    print(
+        "TorchScript scripting failed."
+    )
+
+    print(
+        "Falling back to tracing..."
+    )
+
+    print(
+        "Script error:",
+        repr(script_error),
+    )
+
+    example_input = test_images[:1]
+
+    scripted_model = torch.jit.trace(
+        quantized_model,
+        example_input,
+    )
+
+    scripted_model.save(
+        SCRIPTED_MODEL_PATH
+    )
+
+    serialization_method = "trace"
+
+    print(
+        "TorchScript tracing successful."
+    )
+
+
+# ============================================================
+# Reload TorchScript model
+# ============================================================
+
+loaded_scripted_model = torch.jit.load(
+    SCRIPTED_MODEL_PATH,
+    map_location="cpu",
 )
 
-torch.save(
-    quantized_model,
-    QUANTIZED_MODEL_PATH,
+loaded_scripted_model.eval()
+
+
+# ============================================================
+# Verify the SERIALIZED model
+# ============================================================
+
+with torch.no_grad():
+
+    reloaded_outputs = (
+        loaded_scripted_model(test_images)
+    )
+
+reloaded_predictions = (
+    reloaded_outputs.argmax(dim=1)
+)
+
+print()
+print(
+    "TorchScript reload successful."
 )
 
 print(
-    "Quantized model:",
-    QUANTIZED_MODEL_PATH,
+    "Serialization method:",
+    serialization_method,
+)
+
+print(
+    "Reloaded output shape:",
+    reloaded_outputs.shape,
+)
+
+print(
+    "Reloaded predictions:",
+    reloaded_predictions.tolist(),
 )
 
 
 # ============================================================
-# Compare checkpoint sizes
+# Compare original INT8 model and reloaded model
+# ============================================================
+
+if torch.allclose(
+    test_outputs,
+    reloaded_outputs,
+    atol=1e-4,
+    rtol=1e-3,
+):
+
+    print(
+        "Serialization verification: PASSED."
+    )
+
+else:
+
+    raise RuntimeError(
+        "Serialized TorchScript model "
+        "does not reproduce the original "
+        "INT8 model outputs."
+    )
+
+
+# ============================================================
+# Compare file sizes
 # ============================================================
 
 original_size = os.path.getsize(
     MODEL_PATH
 )
 
-quantized_size = os.path.getsize(
-    QUANTIZED_MODEL_PATH
+scripted_size = os.path.getsize(
+    SCRIPTED_MODEL_PATH
 )
 
 reduction = (
-    1 - quantized_size / original_size
+    1 - scripted_size / original_size
 ) * 100
 
 
 print()
+print(
+    "TorchScript INT8 model:",
+    SCRIPTED_MODEL_PATH,
+)
 
 print(
     f"Original checkpoint size: "
@@ -283,8 +395,8 @@ print(
 )
 
 print(
-    f"Quantized checkpoint size: "
-    f"{quantized_size / 1024:.2f} KB"
+    f"TorchScript INT8 size: "
+    f"{scripted_size / 1024:.2f} KB"
 )
 
 print(
