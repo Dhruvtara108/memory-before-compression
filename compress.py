@@ -2,8 +2,8 @@
 Phase 3: Post-training static INT8 quantization.
 
 Loads the trained CNN checkpoint, calibrates the model using
-training images, converts the model to an INT8 quantized model,
-and saves the compressed checkpoint.
+a subset of the training images, converts the model to INT8,
+and saves the quantized model.
 """
 
 import os
@@ -31,17 +31,20 @@ QUANTIZED_MODEL_PATH = os.path.join(
     "model_quantized.pt",
 )
 
-SEED = 42
 CALIBRATION_IMAGES = 300
+BATCH_SIZE = 64
+SEED = 42
 
 
 # ============================================================
-# Small CNN
+# Quantizable CNN
 # ============================================================
 
 class SmallCNN(nn.Module):
     def __init__(self):
         super().__init__()
+
+        self.quant = torch.ao.quantization.QuantStub()
 
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
@@ -63,14 +66,24 @@ class SmallCNN(nn.Module):
 
         self.classifier = nn.Linear(128, 10)
 
+        self.dequant = torch.ao.quantization.DeQuantStub()
+
     def forward(self, x):
+        x = self.quant(x)
+
         x = self.features(x)
+
         x = torch.flatten(x, 1)
-        return self.classifier(x)
+
+        x = self.classifier(x)
+
+        x = self.dequant(x)
+
+        return x
 
 
 # ============================================================
-# Load model
+# Load original model
 # ============================================================
 
 checkpoint = torch.load(
@@ -78,13 +91,16 @@ checkpoint = torch.load(
     map_location="cpu",
 )
 
-model = SmallCNN()
+# The original Phase 1 checkpoint was created from the same
+# SmallCNN architecture without quantization stubs.
+original_model = SmallCNN()
 
-model.load_state_dict(
-    checkpoint["model_state_dict"]
+original_model.load_state_dict(
+    checkpoint["model_state_dict"],
+    strict=False,
 )
 
-model.eval()
+original_model.eval()
 
 print("Original model loaded.")
 
@@ -117,7 +133,7 @@ calibration_dataset = Subset(
 
 calibration_loader = DataLoader(
     calibration_dataset,
-    batch_size=64,
+    batch_size=BATCH_SIZE,
     shuffle=False,
 )
 
@@ -128,18 +144,17 @@ print(
 
 
 # ============================================================
-# Quantization configuration
+# Prepare model for quantization
 # ============================================================
 
 torch.backends.quantized.engine = "x86"
 
-model.qconfig = torch.ao.quantization.get_default_qconfig(
-    "x86"
+original_model.qconfig = (
+    torch.ao.quantization.get_default_qconfig("x86")
 )
 
-# Prepare model for calibration.
 torch.ao.quantization.prepare(
-    model,
+    original_model,
     inplace=True,
 )
 
@@ -153,7 +168,7 @@ print("Starting calibration...")
 with torch.no_grad():
 
     for images, _ in calibration_loader:
-        model(images)
+        original_model(images)
 
 print("Calibration complete.")
 
@@ -163,7 +178,7 @@ print("Calibration complete.")
 # ============================================================
 
 quantized_model = torch.ao.quantization.convert(
-    model,
+    original_model,
     inplace=False,
 )
 
@@ -191,7 +206,7 @@ print(
 
 
 # ============================================================
-# Compare model sizes
+# Compare checkpoint sizes
 # ============================================================
 
 original_size = os.path.getsize(
@@ -201,6 +216,10 @@ original_size = os.path.getsize(
 quantized_size = os.path.getsize(
     QUANTIZED_MODEL_PATH
 )
+
+reduction = (
+    1 - quantized_size / original_size
+) * 100
 
 print()
 print(
@@ -215,5 +234,5 @@ print(
 
 print(
     f"Size reduction: "
-    f"{(1 - quantized_size / original_size) * 100:.2f}%"
+    f"{reduction:.2f}%"
 )
