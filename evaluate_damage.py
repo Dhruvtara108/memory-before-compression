@@ -1,17 +1,21 @@
 """
 Phase 4: Measure per-image damage caused by INT8 quantization.
 
-Compares the original FP32 model from Phase 1 with the complete
-quantized INT8 model produced by compress.py.
+Compares the original FP32 model with the serialized TorchScript
+INT8 model on the exact same 3,000 CIFAR-10 images.
 
-For each of the same 3,000 training images, records:
-- true label
-- original prediction
-- original true-class confidence
-- quantized prediction
-- quantized true-class confidence
-- whether prediction flipped
-- confidence drop
+For every image, records:
+- image_id
+- true_label
+- original_prediction
+- original_confidence
+- quantized_prediction
+- quantized_confidence
+- flipped
+- confidence_drop
+
+Output:
+    results/damage.csv
 """
 
 import csv
@@ -37,7 +41,7 @@ MODEL_PATH = os.path.join(
 
 QUANTIZED_MODEL_PATH = os.path.join(
     RESULTS_DIR,
-    "model_int8.pt",
+    "model_int8_scripted.pt",
 )
 
 OUTPUT_PATH = os.path.join(
@@ -49,7 +53,7 @@ BATCH_SIZE = 64
 
 
 # ============================================================
-# Small CNN
+# Original FP32 model
 # ============================================================
 
 class SmallCNN(nn.Module):
@@ -83,7 +87,7 @@ class SmallCNN(nn.Module):
 
 
 # ============================================================
-# Dataset with stable image IDs
+# Dataset wrapper with stable image IDs
 # ============================================================
 
 class IndexedDataset(Dataset):
@@ -95,8 +99,13 @@ class IndexedDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, position):
-        image, label = self.dataset[self.indices[position]]
-        image_id = int(self.indices[position])
+        image, label = self.dataset[
+            self.indices[position]
+        ]
+
+        image_id = int(
+            self.indices[position]
+        )
 
         return image, label, image_id
 
@@ -111,7 +120,9 @@ checkpoint = torch.load(
     weights_only=False,
 )
 
-subset_indices = checkpoint["subset_indices"]
+subset_indices = checkpoint[
+    "subset_indices"
+]
 
 original_model = SmallCNN()
 
@@ -125,22 +136,23 @@ print("Original FP32 model loaded.")
 
 
 # ============================================================
-# Load complete INT8 model
+# Load serialized TorchScript INT8 model
 # ============================================================
 
-quantized_model = torch.load(
+quantized_model = torch.jit.load(
     QUANTIZED_MODEL_PATH,
     map_location="cpu",
-    weights_only=False,
 )
 
 quantized_model.eval()
 
-print("Complete INT8 model loaded.")
+print(
+    "TorchScript INT8 model loaded."
+)
 
 
 # ============================================================
-# Dataset
+# Load CIFAR-10
 # ============================================================
 
 transform = transforms.Compose([
@@ -172,7 +184,92 @@ print(
 
 
 # ============================================================
-# Evaluate both models
+# Three-image sanity check
+# ============================================================
+
+sanity_images, sanity_labels, sanity_ids = next(
+    iter(evaluation_loader)
+)
+
+sanity_images = sanity_images[:3]
+sanity_labels = sanity_labels[:3]
+sanity_ids = sanity_ids[:3]
+
+with torch.no_grad():
+
+    fp32_sanity_logits = original_model(
+        sanity_images
+    )
+
+    int8_sanity_logits = quantized_model(
+        sanity_images
+    )
+
+fp32_sanity_probs = torch.softmax(
+    fp32_sanity_logits,
+    dim=1,
+)
+
+int8_sanity_probs = torch.softmax(
+    int8_sanity_logits,
+    dim=1,
+)
+
+fp32_sanity_predictions = (
+    fp32_sanity_probs.argmax(dim=1)
+)
+
+int8_sanity_predictions = (
+    int8_sanity_probs.argmax(dim=1)
+)
+
+print()
+print("3-image sanity check:")
+
+for i in range(3):
+
+    image_id = int(
+        sanity_ids[i]
+    )
+
+    true_label = int(
+        sanity_labels[i]
+    )
+
+    fp32_prediction = int(
+        fp32_sanity_predictions[i]
+    )
+
+    int8_prediction = int(
+        int8_sanity_predictions[i]
+    )
+
+    fp32_confidence = float(
+        fp32_sanity_probs[
+            i,
+            true_label,
+        ].item()
+    )
+
+    int8_confidence = float(
+        int8_sanity_probs[
+            i,
+            true_label,
+        ].item()
+    )
+
+    print(
+        f"Image {image_id}: "
+        f"True={true_label}, "
+        f"FP32={fp32_prediction} "
+        f"(confidence={fp32_confidence:.4f}), "
+        f"INT8={int8_prediction} "
+        f"(confidence={int8_confidence:.4f})"
+    )
+
+
+# ============================================================
+# Full damage evaluation
 # ============================================================
 
 results = []
@@ -181,51 +278,79 @@ with torch.no_grad():
 
     for images, labels, image_ids in evaluation_loader:
 
-        # Original model
-        original_logits = original_model(images)
+        # ----------------------------------------------------
+        # FP32 inference
+        # ----------------------------------------------------
 
-        # Quantized model
-        quantized_logits = quantized_model(images)
+        fp32_logits = original_model(
+            images
+        )
 
-        original_probs = torch.softmax(
-            original_logits,
+        # ----------------------------------------------------
+        # INT8 inference
+        # ----------------------------------------------------
+
+        int8_logits = quantized_model(
+            images
+        )
+
+        # ----------------------------------------------------
+        # Convert logits to probabilities
+        # ----------------------------------------------------
+
+        fp32_probs = torch.softmax(
+            fp32_logits,
             dim=1,
         )
 
-        quantized_probs = torch.softmax(
-            quantized_logits,
+        int8_probs = torch.softmax(
+            int8_logits,
             dim=1,
         )
 
-        original_predictions = (
-            original_probs.argmax(dim=1)
+        # ----------------------------------------------------
+        # Predictions
+        # ----------------------------------------------------
+
+        fp32_predictions = (
+            fp32_probs.argmax(dim=1)
         )
 
-        quantized_predictions = (
-            quantized_probs.argmax(dim=1)
+        int8_predictions = (
+            int8_probs.argmax(dim=1)
         )
+
+        # ----------------------------------------------------
+        # Per-image records
+        # ----------------------------------------------------
 
         for i in range(len(images)):
 
-            true_label = int(labels[i])
+            image_id = int(
+                image_ids[i]
+            )
+
+            true_label = int(
+                labels[i]
+            )
 
             original_prediction = int(
-                original_predictions[i]
+                fp32_predictions[i]
             )
 
             quantized_prediction = int(
-                quantized_predictions[i]
+                int8_predictions[i]
             )
 
             original_confidence = float(
-                original_probs[
+                fp32_probs[
                     i,
                     true_label,
                 ].item()
             )
 
             quantized_confidence = float(
-                quantized_probs[
+                int8_probs[
                     i,
                     true_label,
                 ].item()
@@ -242,7 +367,7 @@ with torch.no_grad():
             )
 
             results.append([
-                int(image_ids[i]),
+                image_id,
                 true_label,
                 original_prediction,
                 original_confidence,
@@ -254,7 +379,7 @@ with torch.no_grad():
 
 
 # ============================================================
-# Save damage results
+# Save CSV
 # ============================================================
 
 os.makedirs(
@@ -285,7 +410,7 @@ with open(
 
 
 # ============================================================
-# Summary
+# Summary statistics
 # ============================================================
 
 num_images = len(results)
@@ -299,11 +424,60 @@ flip_rate = (
     num_flipped / num_images
 )
 
-print()
-print("Damage evaluation complete.")
-print("Images evaluated:", num_images)
-print("Prediction flips:", num_flipped)
-print(
-    f"Flip rate: {flip_rate * 100:.2f}%"
+confidence_drops = [
+    row[7]
+    for row in results
+]
+
+confidence_tensor = torch.tensor(
+    confidence_drops,
+    dtype=torch.float64,
 )
-print("Output:", OUTPUT_PATH)
+
+mean_confidence_drop = float(
+    confidence_tensor.mean().item()
+)
+
+median_confidence_drop = float(
+    confidence_tensor.median().item()
+)
+
+
+# ============================================================
+# Final output
+# ============================================================
+
+print()
+print(
+    "Damage evaluation complete."
+)
+
+print(
+    "Total images evaluated:",
+    num_images,
+)
+
+print(
+    "Number flipped:",
+    num_flipped,
+)
+
+print(
+    f"Flip rate: "
+    f"{flip_rate * 100:.2f}%"
+)
+
+print(
+    f"Mean confidence drop: "
+    f"{mean_confidence_drop:.6f}"
+)
+
+print(
+    f"Median confidence drop: "
+    f"{median_confidence_drop:.6f}"
+)
+
+print(
+    "Output:",
+    OUTPUT_PATH,
+)
