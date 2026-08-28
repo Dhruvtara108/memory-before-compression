@@ -16,6 +16,11 @@ For every image, records:
 
 Output:
     results/damage.csv
+
+Additional diagnostics:
+1. Explicit confidence_drop definition.
+2. Confidence-drop distribution.
+3. Median CSL score for flipped vs non-flipped images.
 """
 
 import csv
@@ -49,6 +54,11 @@ OUTPUT_PATH = os.path.join(
     "damage.csv",
 )
 
+CSL_PATH = os.path.join(
+    RESULTS_DIR,
+    "csl_scores.csv",
+)
+
 BATCH_SIZE = 64
 
 
@@ -61,24 +71,47 @@ class SmallCNN(nn.Module):
         super().__init__()
 
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.Conv2d(
+                3,
+                32,
+                kernel_size=3,
+                padding=1,
+            ),
             nn.ReLU(),
             nn.MaxPool2d(2),
 
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(
+                32,
+                64,
+                kernel_size=3,
+                padding=1,
+            ),
             nn.ReLU(),
             nn.MaxPool2d(2),
 
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.Conv2d(
+                64,
+                128,
+                kernel_size=3,
+                padding=1,
+            ),
             nn.ReLU(),
             nn.MaxPool2d(2),
 
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                padding=1,
+            ),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
 
-        self.classifier = nn.Linear(128, 10)
+        self.classifier = nn.Linear(
+            128,
+            10,
+        )
 
     def forward(self, x):
         x = self.features(x)
@@ -91,14 +124,22 @@ class SmallCNN(nn.Module):
 # ============================================================
 
 class IndexedDataset(Dataset):
-    def __init__(self, dataset, indices):
+
+    def __init__(
+        self,
+        dataset,
+        indices,
+    ):
         self.dataset = dataset
         self.indices = indices
 
     def __len__(self):
         return len(self.indices)
 
-    def __getitem__(self, position):
+    def __getitem__(
+        self,
+        position,
+    ):
         image, label = self.dataset[
             self.indices[position]
         ]
@@ -107,7 +148,11 @@ class IndexedDataset(Dataset):
             self.indices[position]
         )
 
-        return image, label, image_id
+        return (
+            image,
+            label,
+            image_id,
+        )
 
 
 # ============================================================
@@ -132,7 +177,9 @@ original_model.load_state_dict(
 
 original_model.eval()
 
-print("Original FP32 model loaded.")
+print(
+    "Original FP32 model loaded."
+)
 
 
 # ============================================================
@@ -195,15 +242,21 @@ sanity_images = sanity_images[:3]
 sanity_labels = sanity_labels[:3]
 sanity_ids = sanity_ids[:3]
 
+
 with torch.no_grad():
 
-    fp32_sanity_logits = original_model(
-        sanity_images
+    fp32_sanity_logits = (
+        original_model(
+            sanity_images
+        )
     )
 
-    int8_sanity_logits = quantized_model(
-        sanity_images
+    int8_sanity_logits = (
+        quantized_model(
+            sanity_images
+        )
     )
+
 
 fp32_sanity_probs = torch.softmax(
     fp32_sanity_logits,
@@ -215,6 +268,7 @@ int8_sanity_probs = torch.softmax(
     dim=1,
 )
 
+
 fp32_sanity_predictions = (
     fp32_sanity_probs.argmax(dim=1)
 )
@@ -223,8 +277,12 @@ int8_sanity_predictions = (
     int8_sanity_probs.argmax(dim=1)
 )
 
+
 print()
-print("3-image sanity check:")
+print(
+    "3-image sanity check:"
+)
+
 
 for i in range(3):
 
@@ -274,9 +332,14 @@ for i in range(3):
 
 results = []
 
+
 with torch.no_grad():
 
-    for images, labels, image_ids in evaluation_loader:
+    for (
+        images,
+        labels,
+        image_ids,
+    ) in evaluation_loader:
 
         # ----------------------------------------------------
         # FP32 inference
@@ -342,6 +405,11 @@ with torch.no_grad():
                 int8_predictions[i]
             )
 
+            # IMPORTANT:
+            # Confidence is probability assigned to the
+            # TRUE LABEL, not probability of the predicted
+            # class.
+
             original_confidence = float(
                 fp32_probs[
                     i,
@@ -355,6 +423,13 @@ with torch.no_grad():
                     true_label,
                 ].item()
             )
+
+            # Formula:
+            #
+            # confidence_drop =
+            #     original true-label confidence
+            #     -
+            #     quantized true-label confidence
 
             confidence_drop = (
                 original_confidence
@@ -379,13 +454,14 @@ with torch.no_grad():
 
 
 # ============================================================
-# Save CSV
+# Save damage CSV
 # ============================================================
 
 os.makedirs(
     RESULTS_DIR,
     exist_ok=True,
 )
+
 
 with open(
     OUTPUT_PATH,
@@ -406,11 +482,13 @@ with open(
         "confidence_drop",
     ])
 
-    writer.writerows(results)
+    writer.writerows(
+        results
+    )
 
 
 # ============================================================
-# Summary statistics
+# Basic summary statistics
 # ============================================================
 
 num_images = len(results)
@@ -421,7 +499,8 @@ num_flipped = sum(
 )
 
 flip_rate = (
-    num_flipped / num_images
+    num_flipped
+    / num_images
 )
 
 confidence_drops = [
@@ -444,7 +523,7 @@ median_confidence_drop = float(
 
 
 # ============================================================
-# Final output
+# Final Phase 4 summary
 # ============================================================
 
 print()
@@ -481,3 +560,250 @@ print(
     "Output:",
     OUTPUT_PATH,
 )
+
+
+# ============================================================
+# PHASE 4 DIAGNOSTICS
+# ============================================================
+
+print()
+print("=" * 60)
+print("PHASE 4 DIAGNOSTICS")
+print("=" * 60)
+
+
+# ============================================================
+# 1. Confidence-drop definition
+# ============================================================
+
+print()
+print(
+    "1. Confidence-drop definition"
+)
+
+print(
+    "Formula:"
+)
+
+print(
+    "confidence_drop = "
+    "original true-label confidence "
+    "- quantized true-label confidence"
+)
+
+print(
+    "Therefore:"
+)
+
+print(
+    "Positive confidence_drop = "
+    "INT8 reduced probability assigned to the true label."
+)
+
+print(
+    "Negative confidence_drop = "
+    "INT8 increased probability assigned to the true label."
+)
+
+print(
+    "Confidence means probability assigned to the "
+    "TRUE LABEL, not confidence in the model's predicted class."
+)
+
+
+# ============================================================
+# 2. Confidence-drop distribution
+# ============================================================
+
+negative_count = sum(
+    drop < 0
+    for drop in confidence_drops
+)
+
+zero_to_005_count = sum(
+    0 <= drop < 0.05
+    for drop in confidence_drops
+)
+
+range_005_to_02_count = sum(
+    0.05 <= drop < 0.20
+    for drop in confidence_drops
+)
+
+above_or_equal_02_count = sum(
+    drop >= 0.20
+    for drop in confidence_drops
+)
+
+
+print()
+print(
+    "2. Confidence-drop distribution"
+)
+
+print(
+    f"< 0:        "
+    f"{negative_count:4d} "
+    f"({negative_count / num_images * 100:.2f}%)"
+)
+
+print(
+    f"0–0.05:     "
+    f"{zero_to_005_count:4d} "
+    f"({zero_to_005_count / num_images * 100:.2f}%)"
+)
+
+print(
+    f"0.05–0.20:  "
+    f"{range_005_to_02_count:4d} "
+    f"({range_005_to_02_count / num_images * 100:.2f}%)"
+)
+
+print(
+    f">= 0.20:    "
+    f"{above_or_equal_02_count:4d} "
+    f"({above_or_equal_02_count / num_images * 100:.2f}%)"
+)
+
+print(
+    "Bucket total:",
+    (
+        negative_count
+        + zero_to_005_count
+        + range_005_to_02_count
+        + above_or_equal_02_count
+    ),
+)
+
+
+# ============================================================
+# 3. CSL median: flipped vs non-flipped
+# ============================================================
+
+if not os.path.exists(CSL_PATH):
+
+    raise FileNotFoundError(
+        f"CSL file not found: {CSL_PATH}"
+    )
+
+
+csl_values = {}
+
+
+with open(
+    CSL_PATH,
+    "r",
+    newline="",
+) as file:
+
+    reader = csv.DictReader(file)
+
+    for row in reader:
+
+        image_id = int(
+            row["image_id"]
+        )
+
+        csl_score = float(
+            row["csl_score"]
+        )
+
+        csl_values[image_id] = csl_score
+
+
+flipped_csl = []
+non_flipped_csl = []
+
+
+for row in results:
+
+    image_id = row[0]
+    flipped = row[6]
+
+    if image_id not in csl_values:
+
+        raise RuntimeError(
+            "Missing CSL score for "
+            f"image_id={image_id}"
+        )
+
+    if flipped == 1:
+
+        flipped_csl.append(
+            csl_values[image_id]
+        )
+
+    else:
+
+        non_flipped_csl.append(
+            csl_values[image_id]
+        )
+
+
+if not flipped_csl:
+
+    raise RuntimeError(
+        "No flipped images found; "
+        "cannot compute flipped-group median CSL."
+    )
+
+
+if not non_flipped_csl:
+
+    raise RuntimeError(
+        "No non-flipped images found; "
+        "cannot compute non-flipped-group median CSL."
+    )
+
+
+flipped_csl_tensor = torch.tensor(
+    flipped_csl,
+    dtype=torch.float64,
+)
+
+non_flipped_csl_tensor = torch.tensor(
+    non_flipped_csl,
+    dtype=torch.float64,
+)
+
+
+flipped_median_csl = float(
+    flipped_csl_tensor.median().item()
+)
+
+non_flipped_median_csl = float(
+    non_flipped_csl_tensor.median().item()
+)
+
+
+print()
+print(
+    "3. Median CSL by prediction-flip group"
+)
+
+print(
+    f"Flipped images:     "
+    f"{len(flipped_csl):4d} images | "
+    f"median CSL = "
+    f"{flipped_median_csl:.6f}"
+)
+
+print(
+    f"Non-flipped images: "
+    f"{len(non_flipped_csl):4d} images | "
+    f"median CSL = "
+    f"{non_flipped_median_csl:.6f}"
+)
+
+print(
+    "CSL group counts total:",
+    len(flipped_csl)
+    + len(non_flipped_csl),
+)
+
+print(
+    "CSL images available:",
+    len(csl_values),
+)
+
+print("=" * 60)
